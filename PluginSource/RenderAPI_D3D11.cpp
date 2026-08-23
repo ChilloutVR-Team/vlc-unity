@@ -9,6 +9,9 @@
 #include <tchar.h>
 #include <windows.h>
 #include <d3d11_1.h>
+#include <atomic>
+#include <chrono>
+#include <cstdint>
 #if SUPPORT_D3D12
 #include <d3d12.h>
 #endif
@@ -16,7 +19,6 @@
 #if defined(SHOW_WATERMARK)
 #include <d2d1.h>
 #include <dwrite.h>
-#include <chrono>
 #endif // SHOW_WATERMARK
 #include "Unity/IUnityGraphicsD3D11.h"
 #if SUPPORT_D3D12
@@ -25,11 +27,21 @@
 #include "Log.h"
 #include "TrialWatermark.h"
 
-#include <algorithm>
 #include <dxgi1_2.h>
 
 #include <memory>
 #include <random>
+#include <thread>
+
+typedef const char* (CDECL *PFN_wine_get_version)(void);
+
+static bool IsWine()
+{
+    HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
+    if (!hNtdll) return false;
+    PFN_wine_get_version pfn = (PFN_wine_get_version)GetProcAddress(hNtdll, "wine_get_version");
+    return pfn != nullptr;
+}
 
 #if defined(SHOW_WATERMARK)
 static int64_t getCurrentTimeMs()
@@ -54,9 +66,34 @@ enum class WatermarkPosition
     TOP_CENTER = 2
 };
 
+enum class BufferUsage : uint8_t
+{
+    Free = 0,
+    InUseByVLC,
+    ReadyForUnity,
+    InUseByUnity
+};
+
+__attribute__((unused)) static const char* BufferUsageToString(BufferUsage usage)
+{
+    switch (usage)
+    {
+        case BufferUsage::Free: return "Free";
+        case BufferUsage::InUseByVLC: return "InUseByVLC";
+        case BufferUsage::ReadyForUnity: return "ReadyForUnity";
+        case BufferUsage::InUseByUnity: return "InUseByUnity";
+        default: return "Unknown";
+    }
+}
+
 class ReadWriteTexture
 {
 public:
+    ReadWriteTexture()
+    {
+        SetUsage();
+    }
+
     HANDLE                   m_sharedHandle         = nullptr; // handle of the texture used by VLC and the app
     bool                     m_isNTHandle           = false;   // Track which type of handle we have
     ID3D11RenderTargetView   *m_textureRenderTarget = nullptr;
@@ -70,12 +107,26 @@ public:
 
     void Cleanup();
     void Update(unsigned width, unsigned height, IUnknown *m_d3deviceUnity, ID3D11Device *m_d3deviceVLC,
-                bool& useNTHandle
+                bool& useNTHandle, bool isLinear
 #if defined(SHOW_WATERMARK)
                 , ID2D1Factory *d2dFactory, IDWriteFactory *dwriteFactory, IDWriteTextFormat *textFormat
-#endif // SHOW_WATERMARK
-                );
+#endif
+                ); // SHOW_WATERMARK
     void *GetUnityTexture();
+    ID3D11Texture2D *GetTexture2D() const { return m_textureUnity11; }
+
+    void SetUsage(BufferUsage state = BufferUsage::Free)
+    {
+        m_usage.store(state, std::memory_order_release);
+    }
+    bool TryTransitionUsage(BufferUsage expected, BufferUsage desired)
+    {
+        return m_usage.compare_exchange_strong(expected, desired, std::memory_order_acq_rel);
+    }
+    BufferUsage GetUsage() const
+    {
+        return m_usage.load(std::memory_order_acquire);
+    }
 
 private:
     bool Update11(unsigned width, unsigned height, DXGI_FORMAT renderFormat, ID3D11Device *m_d3deviceUnity, bool& useNTHandle);
@@ -89,6 +140,7 @@ private:
     bool                      is_d3d12               = false;
     ID3D12Resource           *m_textureUnity12       = nullptr;
 #endif
+    std::atomic<BufferUsage>  m_usage{BufferUsage::Free};
 };
 
 class RenderAPI_D3D11 : public RenderAPI
@@ -117,15 +169,23 @@ public:
                 libvlc_video_output_mouse_release_cb report_mouse_release,
                 void *report_opaque);
 
-    std::unique_ptr<ReadWriteTexture> read_write[2];
+    std::unique_ptr<ReadWriteTexture> read_write[3];
     bool                    write_on_first = false;
     ReadWriteTexture        *current_texture = nullptr;
     ReadWriteTexture* m_textureForUnity = nullptr;
     bool                    m_useNTHandle = true;  // Try modern path first, set false if unavailable
 private:
+	std::vector<uint8_t> m_swPixelBuffers[2];
+    int m_swWriteIndex = 0;
+    int m_swReadIndex = 1;
+    CRITICAL_SECTION m_swLock;
+    bool m_hasNewSwFrame = false;
+
     void CreateResources();
     void ReleaseResources();
     void Update(UINT width, UINT height);
+    ReadWriteTexture* AcquireWritableTexture();
+    ReadWriteTexture* TryAcquireTexture(ReadWriteTexture* candidate);
 
     UnityGfxRenderer         m_unityRendererType    = kUnityGfxRendererNull;
 
@@ -163,6 +223,10 @@ private:
     int m_bit_depth = 8;
 
     libvlc_media_player_t *m_mp = nullptr;
+    std::atomic<ReadWriteTexture*> m_presentedTexture { nullptr };
+    int m_nextWriteIndex = 0;
+    int m_frameWaitBudgetMs = 3;
+    uint64_t m_forcedReuseCount = 0;
 
 #if defined(SHOW_WATERMARK)
     bool m_trialMessageDrawn = false;
@@ -210,9 +274,10 @@ bool Setup_cb(void **opaque, const libvlc_video_setup_device_cfg_t *cfg, libvlc_
 
 void Cleanup_cb(void *opaque)
 {
-    RenderAPI_D3D11 *me = reinterpret_cast<RenderAPI_D3D11*>(opaque);
+	RenderAPI_D3D11 *me = reinterpret_cast<RenderAPI_D3D11*>(opaque);
     me->read_write[0]->Cleanup();
     me->read_write[1]->Cleanup();
+    me->read_write[2]->Cleanup();
 }
 
 void Report_cb(void *opaque,
@@ -234,23 +299,29 @@ RenderAPI* CreateRenderAPI_D3D11(UnityGfxRenderer apiType)
 RenderAPI_D3D11::RenderAPI_D3D11(UnityGfxRenderer apiType)
     : m_unityRendererType(apiType)
 {
-    ZeroMemory(&m_sizeLock, sizeof(CRITICAL_SECTION));
+	ZeroMemory(&m_sizeLock, sizeof(CRITICAL_SECTION));
     InitializeCriticalSection(&m_sizeLock);
     ZeroMemory(&m_outputLock, sizeof(CRITICAL_SECTION));
     InitializeCriticalSection(&m_outputLock);
+    InitializeCriticalSection(&m_swLock);
 
     read_write[0].reset(new ReadWriteTexture());
     read_write[1].reset(new ReadWriteTexture());
-    current_texture = read_write[0].get();
+    read_write[2].reset(new ReadWriteTexture());
+    
+    current_texture = nullptr;
     m_textureForUnity = nullptr;
     read_write[0]->rwt_bit_depth = m_bit_depth;
     read_write[1]->rwt_bit_depth = m_bit_depth;
+    read_write[2]->rwt_bit_depth = m_bit_depth;
+    m_presentedTexture.store(nullptr, std::memory_order_relaxed);
 }
 
 RenderAPI_D3D11::~RenderAPI_D3D11()
 {
     DeleteCriticalSection(&m_sizeLock);
     DeleteCriticalSection(&m_outputLock);
+    DeleteCriticalSection(&m_swLock);
 }
 
 void RenderAPI_D3D11::setVlcContext(libvlc_media_player_t *mp)
@@ -260,6 +331,65 @@ void RenderAPI_D3D11::setVlcContext(libvlc_media_player_t *mp)
     m_mp = mp;
 
     CreateResources();
+
+    if (IsWine())
+    {
+        DEBUG("[D3D11] Wine/Proton detected. Setting up dynamic double-buffered software pipeline.\n");
+
+        libvlc_video_set_callbacks(
+            mp,
+            // Lock callback: Point LibVLC to current write buffer
+            [](void *opaque, void **planes) -> void* {
+                RenderAPI_D3D11 *me = reinterpret_cast<RenderAPI_D3D11*>(opaque);
+                EnterCriticalSection(&me->m_swLock);
+                size_t reqSize = me->m_width * me->m_height * 4;
+                if (me->m_swPixelBuffers[me->m_swWriteIndex].size() < reqSize && reqSize > 0) {
+                    me->m_swPixelBuffers[me->m_swWriteIndex].resize(reqSize, 0);
+                }
+                *planes = me->m_swPixelBuffers[me->m_swWriteIndex].empty() ? nullptr : me->m_swPixelBuffers[me->m_swWriteIndex].data();
+                LeaveCriticalSection(&me->m_swLock);
+                return nullptr;
+            },
+            // Unlock callback: Flag new frame and swap write target
+            [](void *opaque, void *picture, void *const *planes) {
+                (void)picture; (void)planes;
+                RenderAPI_D3D11 *me = reinterpret_cast<RenderAPI_D3D11*>(opaque);
+                EnterCriticalSection(&me->m_swLock);
+                me->m_hasNewSwFrame = true;
+                me->m_swWriteIndex = 1 - me->m_swWriteIndex;
+                LeaveCriticalSection(&me->m_swLock);
+            },
+            nullptr,
+            this
+        );
+
+        // Dynamic Format Callback: Corrects stride and resolution on live stream connect
+        libvlc_video_set_format_callbacks(
+            mp,
+            [](void **opaque, char *chroma, unsigned *width, unsigned *height, unsigned *pitches, unsigned *lines) -> unsigned {
+                RenderAPI_D3D11 *me = reinterpret_cast<RenderAPI_D3D11*>(*opaque);
+
+                memcpy(chroma, "RGBA", 4);
+
+                *pitches = (*width) * 4;
+                *lines = *height;
+
+                EnterCriticalSection(&me->m_swLock);
+                me->m_width = *width;
+                me->m_height = *height;
+
+                size_t requiredBytes = (*width) * (*height) * 4;
+                me->m_swPixelBuffers[0].resize(requiredBytes, 0);
+                me->m_swPixelBuffers[1].resize(requiredBytes, 0);
+                LeaveCriticalSection(&me->m_swLock);
+
+                return 1;
+            },
+            nullptr
+        );
+
+        return;
+    }
 
     libvlc_video_set_output_callbacks(mp, libvlc_video_engine_d3d11,
                                       Setup_cb, Cleanup_cb, Report_cb, UpdateOutput_cb,
@@ -350,21 +480,83 @@ void RenderAPI_D3D11::ProcessDeviceEvent(UnityGfxDeviceEventType type, IUnityInt
 
 void RenderAPI_D3D11::Update(UINT width, UINT height)
 {
-    EnterCriticalSection(&m_outputLock);
-
+	EnterCriticalSection(&m_outputLock);
     m_width = width;
     m_height = height;
 
 #if defined(SHOW_WATERMARK)
-    read_write[0]->Update(m_width, m_height, m_d3deviceUnity, m_d3deviceVLC, m_useNTHandle, d2dFactory, dwriteFactory, textFormat);
-    read_write[1]->Update(m_width, m_height, m_d3deviceUnity, m_d3deviceVLC, m_useNTHandle, d2dFactory, dwriteFactory, textFormat);
+    read_write[0]->Update(m_width, m_height, m_d3deviceUnity, m_d3deviceVLC, m_useNTHandle, m_linear, d2dFactory, dwriteFactory, textFormat);
+    read_write[1]->Update(m_width, m_height, m_d3deviceUnity, m_d3deviceVLC, m_useNTHandle, m_linear, d2dFactory, dwriteFactory, textFormat);
+    read_write[2]->Update(m_width, m_height, m_d3deviceUnity, m_d3deviceVLC, m_useNTHandle, m_linear, d2dFactory, dwriteFactory, textFormat);
 #else
-    read_write[0]->Update(m_width, m_height, m_d3deviceUnity, m_d3deviceVLC, m_useNTHandle);
-    read_write[1]->Update(m_width, m_height, m_d3deviceUnity, m_d3deviceVLC, m_useNTHandle);
-#endif // SHOW_WATERMARK
-    DEBUG("Shared resource mode: %s\n", m_useNTHandle ? "modern (NTHANDLE)" : "legacy (GetSharedHandle)");
-
+    read_write[0]->Update(m_width, m_height, m_d3deviceUnity, m_d3deviceVLC, m_useNTHandle, m_linear);
+    read_write[1]->Update(m_width, m_height, m_d3deviceUnity, m_d3deviceVLC, m_useNTHandle, m_linear);
+    read_write[2]->Update(m_width, m_height, m_d3deviceUnity, m_d3deviceVLC, m_useNTHandle, m_linear);
+#endif
     LeaveCriticalSection(&m_outputLock);
+}
+
+ReadWriteTexture* RenderAPI_D3D11::TryAcquireTexture(ReadWriteTexture* candidate)
+{
+    if (!candidate)
+        return nullptr;
+
+    if (candidate->TryTransitionUsage(BufferUsage::Free, BufferUsage::InUseByVLC))
+        return candidate;
+
+    return nullptr;
+}
+
+ReadWriteTexture* RenderAPI_D3D11::AcquireWritableTexture()
+{
+// Try to find any Free buffer in the 3-texture pool
+    for (int i = 0; i < 3; ++i)
+    {
+        int idx = (m_nextWriteIndex + i) % 3;
+        if (ReadWriteTexture* tex = TryAcquireTexture(read_write[idx].get()))
+        {
+            m_nextWriteIndex = (idx + 1) % 3;
+            return tex;
+        }
+    }
+
+    // Brief spin wait if all buffers are busy
+    if (m_frameWaitBudgetMs > 0)
+    {
+        auto start = std::chrono::steady_clock::now();
+        while (true)
+        {
+            std::this_thread::sleep_for(std::chrono::microseconds(250));
+            for (int i = 0; i < 3; ++i)
+            {
+                int idx = (m_nextWriteIndex + i) % 3;
+                if (ReadWriteTexture* tex = TryAcquireTexture(read_write[idx].get()))
+                {
+                    m_nextWriteIndex = (idx + 1) % 3;
+                    return tex;
+                }
+            }
+
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start);
+            if (elapsed.count() >= m_frameWaitBudgetMs)
+                break;
+        }
+    }
+
+    // Forced reuse fallback if Unity framerate is extremely low
+    ++m_forcedReuseCount;
+    ReadWriteTexture* fallback = read_write[m_nextWriteIndex].get();
+    
+    if (fallback == m_textureForUnity)
+    {
+        m_textureForUnity = nullptr;
+        m_updated = false;
+    }
+
+    fallback->SetUsage(BufferUsage::InUseByVLC);
+    m_nextWriteIndex = (m_nextWriteIndex + 1) % 3;
+    return fallback;
 }
 
 bool ReadWriteTexture::Update11(unsigned width, unsigned height, DXGI_FORMAT renderFormat, ID3D11Device *m_d3deviceUnity, bool& useNTHandle)
@@ -380,9 +572,15 @@ bool ReadWriteTexture::Update11(unsigned width, unsigned height, DXGI_FORMAT ren
     texDesc.Format = renderFormat;
     texDesc.Height = height;
     texDesc.Width = width;
-    texDesc.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
-    if (useNTHandle) {
-        texDesc.MiscFlags |= D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+
+    bool isWineEnv = IsWine();
+    if (!isWineEnv) {
+        texDesc.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
+        if (useNTHandle) {
+            texDesc.MiscFlags |= D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+        }
+    } else {
+        texDesc.MiscFlags = 0;
     }
 
     HRESULT hr;
@@ -407,7 +605,11 @@ bool ReadWriteTexture::Update11(unsigned width, unsigned height, DXGI_FORMAT ren
     bool sharedHandleAcquired = false;
     m_isNTHandle = false;
 
-    if (useNTHandle) {
+    if (isWineEnv) {
+        sharedHandleAcquired = true;
+        m_sharedHandle = nullptr;
+    }
+    else if (useNTHandle) {
         // Modern path: DXGI 1.2 - IDXGIResource1::CreateSharedHandle
         IDXGIResource1* sharedResource = NULL;
         hr = m_textureUnity11->QueryInterface(__uuidof(IDXGIResource1), (void**)&sharedResource);
@@ -522,7 +724,7 @@ bool ReadWriteTexture::Update12(unsigned width, unsigned height, DXGI_FORMAT ren
 #endif
 
 void ReadWriteTexture::Update(unsigned width, unsigned height, IUnknown *m_d3deviceUnity, ID3D11Device *m_d3deviceVLC,
-                              bool& useNTHandle
+                              bool& useNTHandle, bool isLinear
 #if defined(SHOW_WATERMARK)
                               , ID2D1Factory *d2dFactory, IDWriteFactory *dwriteFactory, IDWriteTextFormat *textFormat
 #endif // SHOW_WATERMARK
@@ -537,7 +739,7 @@ void ReadWriteTexture::Update(unsigned width, unsigned height, IUnknown *m_d3dev
     if (rwt_bit_depth == 16) {
         renderFormat = DXGI_FORMAT_R16G16B16A16_UNORM;
     } else {
-        renderFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+        renderFormat = isLinear ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : DXGI_FORMAT_R8G8B8A8_UNORM;
     }
 
     DEBUG("Done releasing d3d objects.\n");
@@ -574,26 +776,40 @@ void ReadWriteTexture::Update(unsigned width, unsigned height, IUnknown *m_d3dev
     ID3D11Texture2D* textureVLC = nullptr;
     if (m_d3deviceVLC)
     {
-        if (m_isNTHandle) {
-            // Modern path: D3D11.1 - ID3D11Device1::OpenSharedResource1
-            ID3D11Device1* d3d11VLC1 = nullptr;
-            hr = m_d3deviceVLC->QueryInterface(__uuidof(ID3D11Device1), (void**)&d3d11VLC1);
-            if (SUCCEEDED(hr) && d3d11VLC1) {
-                hr = d3d11VLC1->OpenSharedResource1(m_sharedHandle,
+        ID3D11Device* d3d11UnityDevice = nullptr;
+        m_d3deviceUnity->QueryInterface(__uuidof(ID3D11Device), (void**)&d3d11UnityDevice);
+
+        if (d3d11UnityDevice && d3d11UnityDevice == m_d3deviceVLC)
+        {
+            textureVLC = m_textureUnity11;
+            if (textureVLC) textureVLC->AddRef();
+            d3d11UnityDevice->Release();
+        }
+        else
+        {
+            if (d3d11UnityDevice) d3d11UnityDevice->Release();
+
+            if (m_isNTHandle) {
+                // Modern path: D3D11.1 - ID3D11Device1::OpenSharedResource1
+                ID3D11Device1* d3d11VLC1 = nullptr;
+                hr = m_d3deviceVLC->QueryInterface(__uuidof(ID3D11Device1), (void**)&d3d11VLC1);
+                if (SUCCEEDED(hr) && d3d11VLC1) {
+                    hr = d3d11VLC1->OpenSharedResource1(m_sharedHandle,
+                        __uuidof(ID3D11Texture2D), (void**)&textureVLC);
+                    if (FAILED(hr)) {
+                        DEBUG("OpenSharedResource1 FAILED: 0x%lx\n", hr);
+                        textureVLC = nullptr;
+                    }
+                    d3d11VLC1->Release();
+                }
+            } else {
+                // Legacy path: D3D11.0 - ID3D11Device::OpenSharedResource
+                hr = m_d3deviceVLC->OpenSharedResource(m_sharedHandle,
                     __uuidof(ID3D11Texture2D), (void**)&textureVLC);
                 if (FAILED(hr)) {
                     DEBUG("OpenSharedResource1 FAILED: 0x%lx\n", hr);
                     textureVLC = nullptr;
                 }
-                d3d11VLC1->Release();
-            }
-        } else {
-            // Legacy path: D3D11.0 - ID3D11Device::OpenSharedResource
-            hr = m_d3deviceVLC->OpenSharedResource(m_sharedHandle,
-                __uuidof(ID3D11Texture2D), (void**)&textureVLC);
-            if (FAILED(hr)) {
-                DEBUG("OpenSharedResource FAILED: 0x%lx\n", hr);
-                textureVLC = nullptr;
             }
         }
     }
@@ -659,6 +875,8 @@ void ReadWriteTexture::Update(unsigned width, unsigned height, IUnknown *m_d3dev
         textureVLC->Release();
         textureVLC = NULL;
     }
+
+    SetUsage(BufferUsage::Free);
 }
 
 void *ReadWriteTexture::GetUnityTexture()
@@ -679,6 +897,26 @@ void RenderAPI_D3D11::CreateResources()
     {
         DEBUG("Could not retrieve unity d3device %p, aborting... \n", m_d3deviceUnity);
         return;
+    }
+
+    if (IsWine())
+    {
+        DEBUG("[D3D11] Wine/Proton detected! Using Unity's D3D11 device directly.\n");
+        ID3D11Device* unityDevice = nullptr;
+        HRESULT hrWine = m_d3deviceUnity->QueryInterface(__uuidof(ID3D11Device), (void**)&unityDevice);
+        if (SUCCEEDED(hrWine) && unityDevice)
+        {
+            m_d3deviceVLC = unityDevice;
+            m_d3deviceVLC->GetImmediateContext(&m_d3dctxVLC);
+
+            ID3D10Multithread *pMultithread = nullptr;
+            if (SUCCEEDED(m_d3dctxVLC->QueryInterface(&pMultithread))) {
+                pMultithread->SetMultithreadProtected(TRUE);
+                pMultithread->Release();
+            }
+            DEBUG("Exiting CreateResources (Wine single-device mode).\n");
+            return;
+        }
     }
 
     HRESULT hr;
@@ -932,12 +1170,19 @@ void ReadWriteTexture::Cleanup()
         // Legacy handles from GetSharedHandle() must NOT be closed
         m_sharedHandle = nullptr;
     }
+
+    SetUsage(BufferUsage::Free);
     m_isNTHandle = false;
 }
 
 void RenderAPI_D3D11::ReleaseResources()
 {
     DEBUG("ReleaseResources called \n");
+
+    m_presentedTexture.store(nullptr, std::memory_order_release);
+    m_textureForUnity = nullptr;
+    current_texture = nullptr;
+    m_updated = false;
 
 #if defined(SHOW_WATERMARK)
     releaseTrialTexture();
@@ -1000,9 +1245,24 @@ bool RenderAPI_D3D11::UpdateOutput(const libvlc_video_render_cfg_t *cfg, libvlc_
 }
 void RenderAPI_D3D11::Swap()
 {
+    // Flush VLC device context to ensure all GPU commands (VLC rendering + any D2D
+    // watermark drawing) are submitted before Unity reads the shared texture.
+    // Required for legacy shared resources (Windows 7) which lack implicit cross-device sync.
+	// Flush GPU context outside the lock to prevent stalling Unity's thread (might break win 7)
+    if (m_d3dctxVLC)
+        m_d3dctxVLC->Flush();
+	
     EnterCriticalSection(&m_outputLock);
 
     ReadWriteTexture* textureJustWrittenByVLC = current_texture;
+    if (!textureJustWrittenByVLC)
+    {
+        DEBUG("[D3D11] Swap: current_texture is null\n");
+        LeaveCriticalSection(&m_outputLock);
+        return;
+    }
+
+    textureJustWrittenByVLC->SetUsage(BufferUsage::ReadyForUnity);
 
 #if defined(SHOW_WATERMARK)
     bool isPaused = libvlc_unity_trial_is_paused();
@@ -1243,21 +1503,22 @@ void RenderAPI_D3D11::Swap()
     }
 #endif // SHOW_WATERMARK
 
-    // Flush VLC device context to ensure all GPU commands (VLC rendering + any D2D
-    // watermark drawing) are submitted before Unity reads the shared texture.
-    // Required for legacy shared resources (Windows 7) which lack implicit cross-device sync.
-    if (m_d3dctxVLC)
-        m_d3dctxVLC->Flush();
+    // If a previously-swapped frame was never consumed by Unity, it is still
+    // marked ReadyForUnity but is about to be dropped. Nothing else will ever
+    // return it to Free, so recycle it here -- otherwise both buffers can end
+    // up stuck non-Free and every later frame falls into forced reuse.
+	if (m_textureForUnity != nullptr &&
+        m_textureForUnity != textureJustWrittenByVLC &&
+        m_textureForUnity != m_presentedTexture.load(std::memory_order_acquire))
+    {
+        m_textureForUnity->SetUsage(BufferUsage::Free);
+    }
 
     m_textureForUnity = textureJustWrittenByVLC;
     m_updated = true;
     DEBUG_VERBOSE("[D3D11] Swap: m_textureForUnity set, m_updated=true");
 
-    if (current_texture == read_write[0].get()) {
-        current_texture = read_write[1].get();
-    } else {
-        current_texture = read_write[0].get();
-    }
+    current_texture = nullptr;
 
     LeaveCriticalSection(&m_outputLock);
 }
@@ -1269,7 +1530,15 @@ bool RenderAPI_D3D11::MakeCurrent(bool enter)
     if (enter)
     {
         EnterCriticalSection(&m_outputLock);
-        if (current_texture && current_texture->m_textureRenderTarget)
+        ReadWriteTexture* target = AcquireWritableTexture();
+        if (!target)
+        {
+            DEBUG("[D3D11] MakeCurrent: failed to acquire writable texture\n");
+            return false;
+        }
+
+        current_texture = target;
+        if (current_texture->m_textureRenderTarget)
         {
             m_d3dctxVLC->ClearRenderTargetView(current_texture->m_textureRenderTarget, blackRGBA);
         }
@@ -1283,7 +1552,7 @@ bool RenderAPI_D3D11::SelectPlane(size_t plane, void *output)
 {
     (void)output;
     if (plane != 0 || m_d3dctxVLC == NULL) // we only support one packed RGBA plane
-        return false;
+      return false;
 
     if (current_texture && current_texture->m_textureRenderTarget)
     {
@@ -1347,11 +1616,73 @@ void* RenderAPI_D3D11::getVideoFrame(unsigned width, unsigned height, bool* out_
 
     EnterCriticalSection(&m_outputLock);
 
+    if (IsWine())
+    {
+        uint8_t* uploadData = nullptr;
+        unsigned currentWidth = 0;
+        unsigned currentHeight = 0;
+
+        EnterCriticalSection(&m_swLock);
+        if (m_hasNewSwFrame)
+        {
+            m_swReadIndex = 1 - m_swWriteIndex;
+            uploadData = m_swPixelBuffers[m_swReadIndex].data();
+            currentWidth = m_width;
+            currentHeight = m_height;
+            m_hasNewSwFrame = false;
+        }
+        LeaveCriticalSection(&m_swLock);
+
+        if (currentWidth > 0 && currentHeight > 0 && (m_width != width || m_height != height))
+        {
+            this->Update(currentWidth, currentHeight);
+        }
+
+        if (uploadData && m_d3dctxVLC && read_write[0] && currentWidth > 0)
+        {
+            ID3D11Texture2D* tex2D = read_write[0]->GetTexture2D();
+            if (tex2D)
+            {
+                m_d3dctxVLC->UpdateSubresource(tex2D, 0, NULL, uploadData, currentWidth * 4, 0);
+                m_textureForUnity = read_write[0].get();
+                m_updated = true;
+            }
+        }
+    }
+
     if (m_textureForUnity) {
         result = m_textureForUnity->GetUnityTexture();
     }
+    else
+    {
+        ReadWriteTexture* presentedTexture = m_presentedTexture.load(std::memory_order_acquire);
+        if (presentedTexture)
+            result = presentedTexture->GetUnityTexture();
+    }
     local_updated_status = m_updated;
     m_updated = false;
+
+    if (local_updated_status && m_textureForUnity)
+    {
+        ReadWriteTexture* newTexture = m_textureForUnity;
+        ReadWriteTexture* previousTexture = m_presentedTexture.load(std::memory_order_acquire);
+        if (previousTexture != newTexture)
+        {
+            if (previousTexture)
+            {
+                previousTexture->SetUsage(BufferUsage::Free);
+            }
+            newTexture->SetUsage(BufferUsage::InUseByUnity);
+            m_presentedTexture.store(newTexture, std::memory_order_release);
+        }
+        else
+        {
+            // Same buffer re-presented (happens after a forced reuse). Swap()
+            // left it as ReadyForUnity; restore the ownership marker so it is
+            // not stranded in a state nothing ever clears.
+            newTexture->SetUsage(BufferUsage::InUseByUnity);
+        }
+    }
 
 #if defined(SHOW_WATERMARK)
     bool isStopped = libvlc_unity_trial_is_stopped();
