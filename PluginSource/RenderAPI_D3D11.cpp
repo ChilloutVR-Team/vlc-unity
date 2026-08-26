@@ -180,6 +180,7 @@ private:
     int m_swReadIndex = 1;
     CRITICAL_SECTION m_swLock;
     bool m_hasNewSwFrame = false;
+    uint64_t m_lastConsumedFrame = 0;
 
     void CreateResources();
     void ReleaseResources();
@@ -225,8 +226,9 @@ private:
     libvlc_media_player_t *m_mp = nullptr;
     std::atomic<ReadWriteTexture*> m_presentedTexture { nullptr };
     int m_nextWriteIndex = 0;
-    int m_frameWaitBudgetMs = 3;
+    int m_frameWaitBudgetMs = 1;
     uint64_t m_forcedReuseCount = 0;
+    std::atomic<uint64_t> m_vlcFrameCounter{ 0 };
 
 #if defined(SHOW_WATERMARK)
     bool m_trialMessageDrawn = false;
@@ -546,8 +548,19 @@ ReadWriteTexture* RenderAPI_D3D11::AcquireWritableTexture()
 
     // Forced reuse fallback if Unity framerate is extremely low
     ++m_forcedReuseCount;
-    ReadWriteTexture* fallback = read_write[m_nextWriteIndex].get();
-    
+
+    // Find a fallback index that is NOT currently presented to Unity
+    int fallbackIdx = m_nextWriteIndex;
+    ReadWriteTexture* presented = m_presentedTexture.load(std::memory_order_acquire);
+    for (int i = 0; i < 3; ++i) {
+        int checkIdx = (m_nextWriteIndex + i) % 3;
+        if (read_write[checkIdx].get() != presented && read_write[checkIdx].get() != m_textureForUnity) {
+            fallbackIdx = checkIdx;
+            break;
+        }
+    }
+
+    ReadWriteTexture* fallback = read_write[fallbackIdx].get();
     if (fallback == m_textureForUnity)
     {
         m_textureForUnity = nullptr;
@@ -555,7 +568,7 @@ ReadWriteTexture* RenderAPI_D3D11::AcquireWritableTexture()
     }
 
     fallback->SetUsage(BufferUsage::InUseByVLC);
-    m_nextWriteIndex = (m_nextWriteIndex + 1) % 3;
+    m_nextWriteIndex = (fallbackIdx + 1) % 3;
     return fallback;
 }
 
@@ -1251,18 +1264,30 @@ void RenderAPI_D3D11::Swap()
 	// Flush GPU context outside the lock to prevent stalling Unity's thread (might break win 7)
     if (m_d3dctxVLC)
         m_d3dctxVLC->Flush();
+
+    ReadWriteTexture* textureJustWrittenByVLC = nullptr;
 	
     EnterCriticalSection(&m_outputLock);
-
-    ReadWriteTexture* textureJustWrittenByVLC = current_texture;
+    textureJustWrittenByVLC = current_texture;
     if (!textureJustWrittenByVLC)
     {
-        DEBUG("[D3D11] Swap: current_texture is null\n");
         LeaveCriticalSection(&m_outputLock);
         return;
     }
-
     textureJustWrittenByVLC->SetUsage(BufferUsage::ReadyForUnity);
+    m_vlcFrameCounter.fetch_add(1, std::memory_order_release);
+
+    if (m_textureForUnity != nullptr &&
+        m_textureForUnity != textureJustWrittenByVLC &&
+        m_textureForUnity != m_presentedTexture.load(std::memory_order_acquire))
+    {
+        m_textureForUnity->SetUsage(BufferUsage::Free);
+    }
+
+    m_textureForUnity = textureJustWrittenByVLC;
+    m_updated = true;
+    current_texture = nullptr;
+    LeaveCriticalSection(&m_outputLock);
 
 #if defined(SHOW_WATERMARK)
     bool isPaused = libvlc_unity_trial_is_paused();
@@ -1613,6 +1638,7 @@ void* RenderAPI_D3D11::getVideoFrame(unsigned width, unsigned height, bool* out_
 {
     void* result = nullptr;
     bool local_updated_status = false;
+    uint64_t currentFrameSequence = m_vlcFrameCounter.load(std::memory_order_acquire);
 
     EnterCriticalSection(&m_outputLock);
 
@@ -1650,6 +1676,7 @@ void* RenderAPI_D3D11::getVideoFrame(unsigned width, unsigned height, bool* out_
         }
     }
 
+    // Retrieve Unity native texture handle
     if (m_textureForUnity) {
         result = m_textureForUnity->GetUnityTexture();
     }
@@ -1659,11 +1686,20 @@ void* RenderAPI_D3D11::getVideoFrame(unsigned width, unsigned height, bool* out_
         if (presentedTexture)
             result = presentedTexture->GetUnityTexture();
     }
+
+    // Capture update state
     local_updated_status = m_updated;
     m_updated = false;
 
+    // Suppress update if VLC hasn't presented a NEW frame sequence yet
+    if (local_updated_status && currentFrameSequence <= m_lastConsumedFrame)
+    {
+        local_updated_status = false;
+    }
+
     if (local_updated_status && m_textureForUnity)
     {
+        m_lastConsumedFrame = currentFrameSequence; // Update sequence counter tracking
         ReadWriteTexture* newTexture = m_textureForUnity;
         ReadWriteTexture* previousTexture = m_presentedTexture.load(std::memory_order_acquire);
         if (previousTexture != newTexture)
@@ -1677,9 +1713,6 @@ void* RenderAPI_D3D11::getVideoFrame(unsigned width, unsigned height, bool* out_
         }
         else
         {
-            // Same buffer re-presented (happens after a forced reuse). Swap()
-            // left it as ReadyForUnity; restore the ownership marker so it is
-            // not stranded in a state nothing ever clears.
             newTexture->SetUsage(BufferUsage::InUseByUnity);
         }
     }
