@@ -1677,19 +1677,27 @@ void* RenderAPI_D3D11::getVideoFrame(unsigned width, unsigned height, bool* out_
         }
     }
 
-    // Dequeue oldest pending frame (FIFO guarantees correct order)
+    // Drain pending queue to get the newest frame and immediately release skipped intermediate frames
     ReadWriteTexture *newTexture = nullptr;
-    if (!m_pendingTextures.empty()) {
-        newTexture = m_pendingTextures.front();
+    while (!m_pendingTextures.empty()) {
+        ReadWriteTexture *candidate = m_pendingTextures.front();
         m_pendingTextures.pop();
+
+        if (m_pendingTextures.empty()) {
+            // Newest frame in queue
+            newTexture = candidate;
+        } else {
+            // Intermediate stale frame: mark Free if not currently bound to Unity
+            if (candidate != m_presentedTexture.load(std::memory_order_acquire)) {
+                candidate->SetUsage(BufferUsage::Free);
+            }
+        }
     }
 
     if (newTexture) {
         ReadWriteTexture *previousTexture = m_presentedTexture.load(std::memory_order_acquire);
-        if (previousTexture != newTexture) {
-            if (previousTexture) {
-                previousTexture->SetUsage(BufferUsage::Free);
-            }
+        if (previousTexture && previousTexture != newTexture) {
+            previousTexture->SetUsage(BufferUsage::Free);
         }
         newTexture->SetUsage(BufferUsage::InUseByUnity);
         m_presentedTexture.store(newTexture, std::memory_order_release);
@@ -1705,20 +1713,20 @@ void* RenderAPI_D3D11::getVideoFrame(unsigned width, unsigned height, bool* out_
     if (local_updated_status && m_textureForUnity)
     {
         m_lastConsumedFrame = currentFrameSequence; // Update sequence counter tracking
-        ReadWriteTexture* newTexture = m_textureForUnity;
+        ReadWriteTexture* legacyNewTex = m_textureForUnity;
         ReadWriteTexture* previousTexture = m_presentedTexture.load(std::memory_order_acquire);
-        if (previousTexture != newTexture)
+        if (previousTexture != legacyNewTex)
         {
             if (previousTexture)
             {
                 previousTexture->SetUsage(BufferUsage::Free);
             }
-            newTexture->SetUsage(BufferUsage::InUseByUnity);
-            m_presentedTexture.store(newTexture, std::memory_order_release);
+            legacyNewTex->SetUsage(BufferUsage::InUseByUnity);
+            m_presentedTexture.store(legacyNewTex, std::memory_order_release);
         }
         else
         {
-            newTexture->SetUsage(BufferUsage::InUseByUnity);
+            legacyNewTex->SetUsage(BufferUsage::InUseByUnity);
         }
     }
 
