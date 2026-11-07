@@ -183,6 +183,8 @@ private:
     CRITICAL_SECTION m_swLock;
     bool m_hasNewSwFrame = false;
     uint64_t m_lastConsumedFrame = 0;
+    unsigned m_vlcWidth = 0;
+    unsigned m_vlcHeight = 0;
 
     void CreateResources();
     void ReleaseResources();
@@ -377,20 +379,24 @@ void RenderAPI_D3D11::setVlcContext(libvlc_media_player_t *mp)
 
                 memcpy(chroma, "RGBA", 4);
 
-                *pitches = (*width) * 4;
-                *lines = *height;
+                unsigned rawWidth = *width;
+                unsigned rawHeight = *height;
+                // Calculate 16-pixel macroblock padded height for software buffer allocation
+                unsigned alignedHeight = (rawHeight + 15) & ~15;
+
+                *pitches = rawWidth * 4;
+                *lines = rawHeight;
 
                 EnterCriticalSection(&me->m_swLock);
-                me->m_width = *width;
-                me->m_height = *height;
+                me->m_vlcWidth = rawWidth;
+                me->m_vlcHeight = rawHeight;
 
-                size_t requiredBytes = (*width) * (*height) * 4;
+                size_t requiredBytes = (size_t)rawWidth * (size_t)alignedHeight * 4;
                 me->m_swPixelBuffers[0].resize(requiredBytes, 0);
                 me->m_swPixelBuffers[1].resize(requiredBytes, 0);
                 LeaveCriticalSection(&me->m_swLock);
 
-                // Allocate/resize the D3D11 textures for Unity rendering
-                me->Update(*width, *height);
+                me->Update(rawWidth, rawHeight);
 
                 return 1;
             },
@@ -1222,10 +1228,24 @@ void RenderAPI_D3D11::ReleaseResources()
 {
     DEBUG("ReleaseResources called \n");
 
+    EnterCriticalSection(&m_outputLock);
     m_presentedTexture.store(nullptr, std::memory_order_release);
     m_textureForUnity = nullptr;
     current_texture = nullptr;
     m_updated = false;
+
+    std::queue<ReadWriteTexture*> emptyQueue;
+    std::swap(m_pendingTextures, emptyQueue);
+
+    if (m_d3dctxVLC) {
+        m_d3dctxVLC->Release();
+        m_d3dctxVLC = nullptr;
+    }
+    if (m_d3deviceVLC) {
+        m_d3deviceVLC->Release();
+        m_d3deviceVLC = nullptr;
+    }
+    LeaveCriticalSection(&m_outputLock);
 
 #if defined(SHOW_WATERMARK)
     releaseTrialTexture();
@@ -1286,18 +1306,24 @@ bool RenderAPI_D3D11::UpdateOutput(const libvlc_video_render_cfg_t *cfg, libvlc_
 
     return true;
 }
+
 void RenderAPI_D3D11::Swap()
 {
     // Flush VLC device context to ensure all GPU commands (VLC rendering + any D2D
     // watermark drawing) are submitted before Unity reads the shared texture.
     // Required for legacy shared resources (Windows 7) which lack implicit cross-device sync.
 	// Flush GPU context outside the lock to prevent stalling Unity's thread (might break win 7)
-    if (m_d3dctxVLC)
-        m_d3dctxVLC->Flush();
-
     ReadWriteTexture* textureJustWrittenByVLC = nullptr;
 	
     EnterCriticalSection(&m_outputLock);
+
+    if (m_d3dctxVLC) {
+        m_d3dctxVLC->Flush();
+    } else {
+        LeaveCriticalSection(&m_outputLock);
+        return;
+    }
+
     textureJustWrittenByVLC = current_texture;
     if (!textureJustWrittenByVLC)
     {
@@ -1655,19 +1681,38 @@ void* RenderAPI_D3D11::getVideoFrame(unsigned width, unsigned height, bool* out_
     bool local_updated_status = false;
     uint64_t currentFrameSequence = m_vlcFrameCounter.load(std::memory_order_acquire);
 
+    if (width > 0 && height > 0)
+    {
+        unsigned expectedPaddedHeight = (height + 15) & ~15;
+
+        if (m_vlcWidth == width && (m_vlcHeight == height || m_vlcHeight == expectedPaddedHeight))
+        {
+            if (m_height != height || m_width != width)
+            {
+                this->Update(width, height);
+            }
+        }
+    }
+
     EnterCriticalSection(&m_outputLock);
 
     if (IsWine()) {
-        // Wine/Proton: upload software frame directly
         uint8_t *uploadData = nullptr;
+        size_t bufferSize = 0;
+
         EnterCriticalSection(&m_swLock);
         if (m_hasNewSwFrame) {
             m_swReadIndex = 1 - m_swWriteIndex;
+            bufferSize = m_swPixelBuffers[m_swReadIndex].size();
             uploadData = m_swPixelBuffers[m_swReadIndex].data();
             m_hasNewSwFrame = false;
         }
         LeaveCriticalSection(&m_swLock);
-        if (uploadData && m_d3dctxVLC && read_write[0] && m_width > 0) {
+
+        size_t requiredBytes = (size_t)m_width * (size_t)m_height * 4;
+
+        // Upload only the active display rows (m_height) into the D3D11 texture
+        if (uploadData && bufferSize >= requiredBytes && m_d3dctxVLC && read_write[0] && m_width > 0) {
             ID3D11Texture2D *tex2D = read_write[0]->GetTexture2D();
             if (tex2D) {
                 m_d3dctxVLC->UpdateSubresource(tex2D, 0, NULL, uploadData, m_width * 4, 0);
@@ -1811,12 +1856,13 @@ void* RenderAPI_D3D11::getVideoFrame(unsigned width, unsigned height, bool* out_
 
     *out_updated = local_updated_status;
 
+    // Check size changes using active texture dimensions (prevents per-frame m_ReportSize loops)
     if (m_width != width || m_height != height)
     {
         EnterCriticalSection(&m_sizeLock);
         if (m_ReportSize != nullptr && (this->m_width != width || this->m_height != height))
         {
-             m_ReportSize(m_reportOpaque, width, height);
+            m_ReportSize(m_reportOpaque, width, height);
         }
         LeaveCriticalSection(&m_sizeLock);
     }
